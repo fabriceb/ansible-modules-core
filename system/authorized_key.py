@@ -37,7 +37,8 @@ options:
     aliases: []
   key:
     description:
-      - The SSH public key, as a string
+      - The SSH public key, as a string.
+        Can be multiple SSH public keys, separated by newline characters "\n"
     required: true
     default: null
   path:
@@ -60,13 +61,17 @@ options:
     version_added: "1.2"
   state:
     description:
-      - Whether the given key (with the given key_options) should or should not be in the file
+      - Whether the given key or keys (with the given key_options) should be:
+        in the file (present), not be in the file (absent) or should replace all
+        the existing keys (replace_all).
     required: false
-    choices: [ "present", "absent" ]
+    choices: [ "present", "absent", "replace_all" ]
     default: "present"
   key_options:
     description:
       - A string of ssh key options to be prepended to the key in the authorized_keys file
+        Deprecated: the preferred way to specify key options is to add them directly with
+        the key, using the authorized_keys syntax, cf. http://man.he.net/man5/authorized_keys
     required: false
     default: null
     version_added: "1.4"
@@ -274,6 +279,24 @@ def parsekey(module, raw_key):
 
     return (key, key_type, options, comment)
 
+def parsekeys(module, keys_string):
+    '''
+    parses a string of keys, separated by newline characters
+    '''
+
+    # extract individual keys into an array, skipping blank lines and comments
+    keys = [s for s in keys_string.splitlines() if s and not s.startswith('#')]
+
+    parsed_keys = {}
+    for key in keys:
+        parsed_key = parsekey(module, key)
+        if parsed_key:
+            parsed_keys[parsed_key[0]] = parsed_key
+        else:
+            module.fail_json(msg="invalid key specified: %s" % key)
+
+    return parsed_keys
+
 def readkeys(module, filename):
 
     if not os.path.isfile(filename):
@@ -333,59 +356,46 @@ def enforce_state(module, params):
     state       = params.get("state", "present")
     key_options = params.get("key_options", None)
 
-    # extract individual keys into an array, skipping blank lines and comments
-    key = [s for s in key.splitlines() if s and not s.startswith('#')]
+    new_keys = parsekeys(module, key)
 
+    if key_options is not None:
+        # should be deprecated.
+        # The key_options parameter supposes there is only one key,
+        # while the key parameter accepts multiple keys, separated by "\n".
+        # --> The key options can and should be set as a prefix of the keys
+        parsed_options = parseoptions(module, key_options)
+        for index, new_key in new_keys.items():
+            new_keys[index] = (new_key[0], new_key[1], parsed_options, new_key[3])
 
     # check current state -- just get the filename, don't create file
     do_write = False
     params["keyfile"] = keyfile(module, user, do_write, path, manage_dir)
     existing_keys = readkeys(module, params["keyfile"])
 
-    # Check our new keys, if any of them exist we'll continue.
-    for new_key in key:
-        parsed_new_key = parsekey(module, new_key)
-        if key_options is not None:
-            parsed_options = parseoptions(module, key_options)
-            parsed_new_key = (parsed_new_key[0], parsed_new_key[1], parsed_options, parsed_new_key[3])
 
-        if not parsed_new_key:
-            module.fail_json(msg="invalid key specified: %s" % new_key)
+    if state == "replace_all":
+        # replace all authorized keys by the new list of keys
+        existing_keys = new_keys
+        do_write = True
+    else:
+        # Check key by key
+        for new_key in new_keys.values():
 
-        present = False
-        matched = False
-        non_matching_keys = []
+            if state=="present":
+                # if key should be present
+                if (not new_key[0] in existing_keys
+                        or new_key != existing_keys[new_key[0]]):
+                    # and key is not found or options do not match, write it
+                    existing_keys[new_key[0]] = new_key
+                    do_write = True
 
-        if parsed_new_key[0] in existing_keys:
-            present = True
-            # Then we check if everything matches, including
-            # the key type and options. If not, we append this
-            # existing key to the non-matching list
-            # We only want it to match everything when the state
-            # is present
-            if parsed_new_key != existing_keys[parsed_new_key[0]] and state == "present":
-                non_matching_keys.append(existing_keys[parsed_new_key[0]])
-            else:
-                matched = True
+            elif state=="absent":
+                # if key should be absent
+                if not new_key[0] in existing_keys:
+                    # but it has been found, delete it
+                    del existing_keys[new_key[0]]
+                    do_write = True
 
-
-        # handle idempotent state=present
-        if state=="present":
-            if len(non_matching_keys) > 0:
-                for non_matching_key in non_matching_keys:
-                    if non_matching_key[0] in existing_keys:
-                        del existing_keys[non_matching_key[0]]
-                        do_write = True
-
-            if not matched:
-                existing_keys[parsed_new_key[0]] = parsed_new_key
-                do_write = True
-
-        elif state=="absent":
-            if not matched:
-                continue
-            del existing_keys[parsed_new_key[0]]
-            do_write = True
 
     if do_write:
         if module.check_mode:
@@ -406,7 +416,7 @@ def main():
            key         = dict(required=True, type='str'),
            path        = dict(required=False, type='str'),
            manage_dir  = dict(required=False, type='bool', default=True),
-           state       = dict(default='present', choices=['absent','present']),
+           state       = dict(default='present', choices=['absent','present','replace_all']),
            key_options = dict(required=False, type='str'),
            unique      = dict(default=False, type='bool'),
         ),
